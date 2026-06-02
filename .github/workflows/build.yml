@@ -1,0 +1,61 @@
+name: Build and Sign
+
+on:
+  push:
+    tags:
+      - 'v*'          # triggers on version tags like v1.0.0
+  workflow_dispatch:  # allows manual trigger from GitHub UI
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install PyQt5 pyvisa pyvisa-py pyserial pyusb pyinstaller
+
+      - name: Build executable with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed `
+            --name "FunctionGeneratorController" `
+            --hidden-import="pyvisa_py" `
+            --hidden-import="pyvisa_py.protocols" `
+            --hidden-import="pyvisa_py.sessions" `
+            --hidden-import="pyvisa_py.tcpip" `
+            --hidden-import="pyvisa_py.serial" `
+            --hidden-import="pyvisa_py.usb" `
+            --hidden-import="serial" `
+            --hidden-import="serial.tools" `
+            --hidden-import="serial.tools.list_ports" `
+            --hidden-import="usb" `
+            --hidden-import="usb.core" `
+            --hidden-import="usb.backend.libusb1" `
+            function_generator_app.py
+
+      - name: Upload unsigned artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FunctionGeneratorController-unsigned
+          path: dist/FunctionGeneratorController.exe
+
+      # SignPath signing step — added after SignPath approval
+      # (leave this commented out until Part 3 is complete)
+      # - name: Sign with SignPath
+      #   uses: signpath/github-action-submit-signing-request@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+      #     project-slug: 'function-generator-controller'
+      #     signing-policy-slug: 'release-signing'
+      #     artifact-configuration-slug: 'exe'
+      #     github-artifact-id: FunctionGeneratorController-unsigned
+      #     output-artifact-directory: dist/signed
