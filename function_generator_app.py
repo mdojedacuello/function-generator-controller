@@ -263,6 +263,7 @@ class InstrumentWorker(QObject):
         self._lock      = threading.Lock()
         self._stop_flag = False
         self._test_mode = False
+        self._ch_state  = {}   # {ch: {freq, volt, phase, enabled}} — updated by run_*
 
     # ── connection ──────────────────────────────────────────
     def connect(self, resource_string: str, buffer_size: int = 1024,
@@ -349,11 +350,16 @@ class InstrumentWorker(QObject):
 
     def _setup_channel(self, ch: int, freq_hz: float, volt: float, phase_deg: float,
                         verbose: bool = True):
+        """Configure one channel and turn its output on.
+        volt is in Vpp — SCPI VOLT command on these generators is peak-to-peak by default.
+        Use VOLT:UNIT VPP to make this explicit if your instrument supports it.
+        """
         self._sel(ch, verbose=verbose)
         self._write(f'FREQ {freq_hz}', verbose=verbose)
-        self._write(f'VOLT {volt}', verbose=verbose)
+        self._write(f'VOLT {volt}', verbose=verbose)   # Vpp
         self._write(f'SINusoid:PHASe {phase_deg}', verbose=verbose)
         self._write('OUTP ON', verbose=verbose)
+        self._update_tracked_state(ch, freq_hz, volt, phase_deg, True)
 
     # ── output master switch ─────────────────────────────────
     def all_output(self, state: bool):
@@ -364,28 +370,39 @@ class InstrumentWorker(QObject):
         for ch in range(1, 5):
             self._sel(ch)
             self._write(f'OUTP {cmd}')
+            if ch in self._ch_state:
+                self._ch_state[ch]['enabled'] = state
         self.log_signal.emit(f"[OUTPUT {'ON' if state else 'OFF'}] all channels")
 
     # ── EROT sweep ───────────────────────────────────────────
     def run_erot(self, frequencies: list, volt: float, dwell_s: float,
-                 summary_only: bool = False):
+                 summary_only: bool = False,
+                 ch_order: tuple = (1, 2, 3, 4)):
         """4-channel 90° phase quadrature sweep.
 
-        summary_only: when True, individual SCPI command lines are suppressed;
-        only one summary line per step is logged (with the measured frequency).
+        ch_order defines which physical channel receives each successive 90°
+        phase step (0°, 90°, 180°, 270°).  The default (1,2,3,4) is the
+        standard assignment.  To reverse rotation direction pass (1,4,3,2),
+        which routes 0°→CH1, 90°→CH4, 180°→CH3, 270°→CH2.
+
+        summary_only: when True, individual SCPI command lines are suppressed.
         """
         self._stop_flag = False
-        phases = [0, 90, 180, 270]
+        phase_steps = [0, 90, 180, 270]
+        # Build {channel: phase} mapping from ch_order
+        ch_phase_map = {ch: phase_steps[i] for i, ch in enumerate(ch_order)}
         verbose = not summary_only
         measured = []
         try:
-            self.log_signal.emit("[EROT] Starting sweep …")
+            direction = "CW (1→4→3→2)" if ch_order == (1,4,3,2) else "CCW (1→2→3→4)"
+            self.log_signal.emit(f"[EROT] Starting sweep — rotation {direction} …")
             for idx, freq in enumerate(frequencies):
                 if self._stop_flag or not self.inst:
                     self.log_signal.emit("[EROT] Sweep aborted (stop or disconnect).")
+                    self.all_output(False)
                     break
-                for ch, phase in enumerate(phases, start=1):
-                    self._setup_channel(ch, freq, volt, phase, verbose=verbose)
+                for ch in sorted(ch_phase_map):
+                    self._setup_channel(ch, freq, volt, ch_phase_map[ch], verbose=verbose)
                 # query measured freq on CH1
                 self._sel(1, verbose=verbose)
                 meas = float(self._query('FREQ?', verbose=verbose))
@@ -488,6 +505,54 @@ class InstrumentWorker(QObject):
         finally:
             self.done_signal.emit("free")
 
+    # ── channel state tracking (for live panel) ─────────────
+    # Updated after every run_* so LivePanel can poll it
+    # regardless of whether we are in real or virtual mode.
+    def _update_tracked_state(self, ch: int, freq: float, volt: float,
+                               phase: float, enabled: bool):
+        self._ch_state[ch] = {
+            'freq': freq, 'volt': volt,
+            'phase': phase, 'enabled': enabled
+        }
+
+    def get_channel_state(self) -> list:
+        """Returns a list of VirtualChannel-like objects for LivePanel.
+        Works in both real and virtual mode."""
+        with self._lock:
+            if self._test_mode and isinstance(self.inst, VirtualInstrument):
+                import copy
+                return [copy.copy(ch) for ch in self.inst._channels.values()]
+            # real mode: return from tracked state
+            result = []
+            for i in range(1, 5):
+                s = self._ch_state.get(i)
+                if s:
+                    vc = VirtualChannel(i)
+                    vc.freq    = s['freq']
+                    vc.volt    = s['volt']
+                    vc.phase   = s['phase']
+                    vc.enabled = s['enabled']
+                    result.append(vc)
+            return result
+
+    def get_channel_state_lines(self) -> list:
+        """Returns summary strings for LivePanel labels."""
+        with self._lock:
+            if self._test_mode and isinstance(self.inst, VirtualInstrument):
+                return self.inst.state_snapshot()
+            lines = []
+            for i in range(1, 5):
+                s = self._ch_state.get(i)
+                if s:
+                    state = "ON " if s['enabled'] else "OFF"
+                    lines.append(
+                        f"CH{i} [{state}]  "
+                        f"{s['freq']:>12.3f} Hz  "
+                        f"{s['volt']:.3f} Vpp  "
+                        f"{s['phase']:>6.1f}°"
+                    )
+            return lines
+
     def stop(self):
         self._stop_flag = True
 
@@ -495,24 +560,70 @@ class InstrumentWorker(QObject):
         """Clear the stop flag before launching any new command."""
         self._stop_flag = False
 
-    # ── test-mode helpers ────────────────────────────────────
+    # ── DC electrophoresis (Tabor WW5064) ────────────────────
+    def run_dc(self, channels: list):
+        """
+        Apply DC voltage to selected channels on the Tabor WW5064.
+
+        The WW5064 is an arbitrary waveform generator; it has no FUNC DC
+        command. DC is produced by:
+          1. Selecting SINusoid waveform
+          2. Setting amplitude to 10 mVpp (minimum) so AC content is negligible
+          3. Setting VOLT:OFFS to the desired DC level (±5 V into 50 Ohm,
+             ±10 V open circuit)
+          4. Turning output ON
+
+        channels: list of dicts {ch, dc_volts, dc_enabled}
+        Channels with dc_enabled=False have offset zeroed and output turned OFF.
+        """
+        self._stop_flag = False
+        try:
+            if not self.inst:
+                self.log_signal.emit("[DC] Aborted — no instrument connected.")
+                return
+            self.log_signal.emit("[DC] Applying DC voltages …")
+            for cfg in channels:
+                self._sel(cfg['ch'])
+                if cfg['dc_enabled']:
+                    v = cfg['dc_volts']
+                    self._write('FUNCtion:SHAPe SINusoid')
+                    self._write('VOLT 0.010')
+                    self._write(f'VOLT:OFFS {v:.4f}')
+                    self._write('OUTP ON')
+                    self.log_signal.emit(
+                        f"  CH{cfg['ch']}  DC = {v:+.4f} V  ON"
+                    )
+                    self._update_tracked_state(cfg['ch'], 0.0, 0.010, 0.0, True)
+                else:
+                    self._write('VOLT:OFFS 0')
+                    self._write('OUTP OFF')
+                    self.log_signal.emit(f"  CH{cfg['ch']}  DC = 0 V  OFF")
+                    self._update_tracked_state(cfg['ch'], 0.0, 0.0, 0.0, False)
+            self.log_signal.emit("[DC] Applied.")
+        except Exception as e:
+            self.error_signal.emit(f"[DC ERROR] {e}")
+        finally:
+            self.done_signal.emit("dc")
+
+    def clear_dc(self, channels: list):
+        """Zero offsets and turn off outputs for the given channel list."""
+        try:
+            if not self.inst:
+                return
+            for ch in channels:
+                self._sel(ch)
+                self._write('VOLT:OFFS 0')
+                self._write('OUTP OFF')
+            self.log_signal.emit("[DC] Offsets cleared, outputs OFF.")
+        except Exception as e:
+            self.error_signal.emit(f"[DC CLEAR ERROR] {e}")
+
+    # ── legacy aliases (kept for any external callers) ──────
     def get_virtual_state(self) -> list:
-        """Returns channel state summary lines under the lock."""
-        with self._lock:
-            if self._test_mode and isinstance(self.inst, VirtualInstrument):
-                return self.inst.state_snapshot()
-        return []
+        return self.get_channel_state_lines()
 
     def get_virtual_channels(self) -> list:
-        """Returns a snapshot list of VirtualChannel objects under the lock.
-        Safe to read from the UI thread while worker threads are mutating state."""
-        with self._lock:
-            if self._test_mode and isinstance(self.inst, VirtualInstrument):
-                # Return shallow copies so the canvas never reads a partially
-                # mutated object after we release the lock.
-                import copy
-                return [copy.copy(ch) for ch in self.inst._channels.values()]
-        return []
+        return self.get_channel_state()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -776,25 +887,24 @@ class ConnectionPanel(QGroupBox):
 # ─────────────────────────────────────────────────────────────
 #  TEST MODE PANEL  (virtual instrument state viewer)
 # ─────────────────────────────────────────────────────────────
-class TestModePanel(QGroupBox):
+class LivePanel(QGroupBox):
     """
-    Floating panel shown only in test mode.
-    Polls the VirtualInstrument every second and renders
-    a live channel state table plus a mini oscilloscope preview.
+    Left-side panel showing live channel state and waveform preview.
+    Works in both real-hardware mode (polls worker._ch_state) and
+    virtual/test mode (reads VirtualInstrument directly).
+    Shown whenever the instrument is connected.
     """
     def __init__(self, worker: 'InstrumentWorker'):
-        super().__init__("🧪  VIRTUAL INSTRUMENT — LIVE STATE")
-        self._worker = worker
+        super().__init__("📡  CHANNEL LIVE STATE")
+        self._worker    = worker
+        self._test_mode = False
         layout = QVBoxLayout(self)
 
-        # header note
-        note = QLabel(
-            "No hardware connected. All SCPI commands are processed by the built-in "
-            "virtual instrument. Channel state below updates in real-time."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#d2a8ff; font-size:11px;")
-        layout.addWidget(note)
+        # mode note (updated when connection type changes)
+        self._note = QLabel("")
+        self._note.setWordWrap(True)
+        self._note.setStyleSheet("font-size:11px;")
+        layout.addWidget(self._note)
 
         # channel state labels
         self._ch_labels: dict[int, QLabel] = {}
@@ -809,7 +919,7 @@ class TestModePanel(QGroupBox):
             self._ch_labels[ch] = val_lbl
         layout.addLayout(ch_grid)
 
-        # waveform canvas (pure Qt, no matplotlib dependency)
+        # waveform canvas
         self._canvas = WaveformCanvas()
         layout.addWidget(self._canvas)
 
@@ -818,21 +928,37 @@ class TestModePanel(QGroupBox):
         self._timer.setInterval(500)
         self._timer.timeout.connect(self._refresh)
 
+    def set_mode(self, test_mode: bool):
+        self._test_mode = test_mode
+        if test_mode:
+            self._note.setText(
+                "TEST MODE — commands go to the built-in virtual instrument."
+            )
+            self._note.setStyleSheet("color:#d2a8ff; font-size:11px;")
+        else:
+            self._note.setText(
+                "LIVE — channel state updated after each Apply. "
+                "Waveform is reconstructed from reported parameters."
+            )
+            self._note.setStyleSheet("color:#8b949e; font-size:11px;")
+
     def start(self):
         self._timer.start()
 
     def stop(self):
         self._timer.stop()
+        # blank out the display when disconnected
+        for lbl in self._ch_labels.values():
+            lbl.setText("—")
+        self._canvas.update_channels([])
 
     def _refresh(self):
-        lines = self._worker.get_virtual_state()
-        if not lines:
-            return
-        chans = self._worker.get_virtual_channels()
-        if not chans:
-            return
-        for ch in range(1, 5):
-            self._ch_labels[ch].setText(lines[ch - 1])
+        lines = self._worker.get_channel_state_lines()
+        chans = self._worker.get_channel_state()
+        if lines:
+            for ch in range(1, 5):
+                if ch - 1 < len(lines):
+                    self._ch_labels[ch].setText(lines[ch - 1])
         self._canvas.update_channels(chans)
 
 
@@ -924,9 +1050,31 @@ class WaveformCanvas(QWidget):
         v_peak = max(c.volt / 2.0 for c in active)   # half-amplitude
         amp_h  = (H / 2.0) * 0.82                    # max pixel swing
 
-        # ── time window: 3 cycles of the fastest active channel ──
-        ref_freq = max(c.freq for c in active)
-        t_span   = 3.0 / ref_freq
+        # ── time window: 3 cycles of the fastest active AC channel ──
+        # Filter out DC channels (freq == 0) for the time-window calculation.
+        ac_active = [c for c in active if c.freq > 0]
+        if ac_active:
+            ref_freq = max(c.freq for c in ac_active)
+            t_span   = 3.0 / ref_freq
+        else:
+            # All active channels are DC: draw flat lines and exit early.
+            from PyQt5.QtGui import QPen, QColor, QFont
+            for ch_obj in self._channels:
+                color = CH_COLORS[ch_obj.ch]
+                if not ch_obj.enabled:
+                    p.setPen(QPen(QColor(color + "33"), 1, Qt.DashLine))
+                    p.drawLine(M, int(mid), W, int(mid))
+                    continue
+                p.setPen(QPen(QColor(color), 2))
+                p.drawLine(M, int(mid), W, int(mid))
+            self._draw_yaxis(p, H, mid, v_peak)
+            p.setPen(QPen(QColor("#30363d"), 1))
+            p.drawLine(M, int(mid), W, int(mid))
+            p.setFont(QFont("Consolas", 8))
+            p.setPen(QPen(QColor("#8b949e"), 1))
+            p.drawText(M + 6, int(mid) - 6, "DC mode")
+            p.end()
+            return
         N = 500
 
         # ── draw waveforms ────────────────────────────────────
@@ -934,6 +1082,12 @@ class WaveformCanvas(QWidget):
             color = CH_COLORS[ch_obj.ch]
             if not ch_obj.enabled:
                 p.setPen(QPen(QColor(color + "33"), 1, Qt.DashLine))
+                p.drawLine(M, int(mid), W, int(mid))
+                continue
+
+            # DC channel mixed with AC: draw flat line, skip waveform
+            if ch_obj.freq == 0:
+                p.setPen(QPen(QColor(color), 2))
                 p.drawLine(M, int(mid), W, int(mid))
                 continue
 
@@ -1013,35 +1167,53 @@ class WaveformCanvas(QWidget):
 #  MODE TABS
 # ─────────────────────────────────────────────────────────────
 class EROTTab(QWidget):
-    run_requested  = pyqtSignal(list, float, float, bool)  # freqs, volt, dwell, summary_only
+    run_requested  = pyqtSignal(list, float, float, bool, tuple)  # freqs, volt, dwell, summary_only, ch_order
     stop_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
 
-        info = QLabel(
-            "ELECTROROTATION  —  4 channels, 90° phase steps "
-            "(CH1: 0°, CH2: 90°, CH3: 180°, CH4: 270°)\n"
-            "Sweep through the frequency list; same potential on all channels."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet("color:#8b949e; font-size:11px; margin-bottom:8px;")
-        layout.addWidget(info)
+        self._info_lbl = QLabel("")
+        self._info_lbl.setWordWrap(True)
+        self._info_lbl.setStyleSheet("color:#8b949e; font-size:11px; margin-bottom:4px;")
+        layout.addWidget(self._info_lbl)
 
-        badge_row = QHBoxLayout()
-        for ch, phase in [(1, '0°'), (2, '90°'), (3, '180°'), (4, '270°')]:
-            frame = QFrame()
-            frame.setStyleSheet(
-                f"border:1px solid {CH_COLORS[ch]}22; border-radius:4px;"
-            )
-            fl = QHBoxLayout(frame)
-            fl.setContentsMargins(8, 4, 8, 4)
-            fl.addWidget(ch_label(ch))
-            fl.addWidget(QLabel(phase))
-            badge_row.addWidget(frame)
-        badge_row.addStretch()
-        layout.addLayout(badge_row)
+        # Rotation direction selector
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("Rotation direction:"))
+        self.btn_ccw = QPushButton("↺  CCW  (1→2→3→4)")
+        self.btn_cw  = QPushButton("↻  CW   (1→4→3→2)")
+        self.btn_ccw.setCheckable(True)
+        self.btn_cw.setCheckable(True)
+        self.btn_ccw.setChecked(True)   # default
+        self.btn_ccw.setStyleSheet(
+            "QPushButton:checked{background:#0d2a4a;border-color:#58a6ff;color:#58a6ff;}"
+        )
+        self.btn_cw.setStyleSheet(
+            "QPushButton:checked{background:#2a0d0d;border-color:#f85149;color:#f85149;}"
+        )
+        def _pick_ccw():
+            self.btn_ccw.setChecked(True)
+            self.btn_cw.setChecked(False)
+            self._update_direction_display()
+        def _pick_cw():
+            self.btn_cw.setChecked(True)
+            self.btn_ccw.setChecked(False)
+            self._update_direction_display()
+        self.btn_ccw.clicked.connect(_pick_ccw)
+        self.btn_cw.clicked.connect(_pick_cw)
+        dir_row.addWidget(self.btn_ccw)
+        dir_row.addWidget(self.btn_cw)
+        dir_row.addStretch()
+        layout.addLayout(dir_row)
+
+        # Badge row — updated dynamically
+        self._badge_row_widget = QWidget()
+        self._badge_layout = QHBoxLayout(self._badge_row_widget)
+        self._badge_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._badge_row_widget)
+        self._update_direction_display()
 
         grp = QGroupBox("SWEEP PARAMETERS")
         g   = QGridLayout(grp)
@@ -1095,6 +1267,45 @@ class EROTTab(QWidget):
         self.btn_run.clicked.connect(self._on_run)
         self.btn_stop.clicked.connect(self.stop_requested)
 
+    @property
+    def _ch_order(self) -> tuple:
+        """Channel order for 0°/90°/180°/270° assignment."""
+        return (1, 4, 3, 2) if self.btn_cw.isChecked() else (1, 2, 3, 4)
+
+    def _update_direction_display(self):
+        """Refresh info label and phase badges to match selected direction."""
+        order = self._ch_order
+        phases = [0, 90, 180, 270]
+        ch_phase = {order[i]: phases[i] for i in range(4)}
+
+        if self.btn_cw.isChecked():
+            self._info_lbl.setText(
+                "ELECTROROTATION  —  CW rotation (1→4→3→2).  "
+                "Phase sequence corrected for electrode layout:\n  1(top-left) 4(top-right) 3(bottom-right) 2(bottom-left)"
+            )
+        else:
+            self._info_lbl.setText(
+                "ELECTROROTATION  —  CCW rotation (1→2→3→4).  "
+                "Default phase sequence:\n  1(top-left) 2(bottom-left) 3(bottom-right) 4(top-right)"
+            )
+
+        # Rebuild badges
+        while self._badge_layout.count():
+            item = self._badge_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for ch in sorted(ch_phase):
+            frame = QFrame()
+            frame.setStyleSheet(
+                f"border:1px solid {CH_COLORS[ch]}22; border-radius:4px;"
+            )
+            fl = QHBoxLayout(frame)
+            fl.setContentsMargins(8, 4, 8, 4)
+            fl.addWidget(ch_label(ch))
+            fl.addWidget(QLabel(f"{ch_phase[ch]}°"))
+            self._badge_layout.addWidget(frame)
+        self._badge_layout.addStretch()
+
     def _on_run(self):
         freqs = self.freq_editor.get_frequencies()
         if not freqs:
@@ -1104,7 +1315,8 @@ class EROTTab(QWidget):
             freqs,
             self.volt_spin.value(),
             self.dwell_spin.value(),
-            self.chk_summary.isChecked()
+            self.chk_summary.isChecked(),
+            self._ch_order
         )
 
     def set_running(self, running: bool):
@@ -1175,15 +1387,11 @@ class DEPTab(QWidget):
         btn_row = QHBoxLayout()
         btn_apply = QPushButton("▶  Apply DEP Signal")
         btn_apply.setObjectName("btn_start")
-        btn_on  = QPushButton("Output ON")
-        btn_on.setObjectName("btn_output_on")
-        btn_off = QPushButton("Output OFF")
+        btn_off = QPushButton("■  Output OFF")
         btn_off.setObjectName("btn_output_off")
         btn_apply.clicked.connect(self._on_apply)
-        btn_on.clicked.connect(lambda: self.output_requested.emit(True))
         btn_off.clicked.connect(lambda: self.output_requested.emit(False))
         btn_row.addWidget(btn_apply)
-        btn_row.addWidget(btn_on)
         btn_row.addWidget(btn_off)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -1261,15 +1469,11 @@ class EORTab(QWidget):
         btn_row = QHBoxLayout()
         btn_apply = QPushButton("▶  Apply EOR Signal")
         btn_apply.setObjectName("btn_start")
-        btn_on  = QPushButton("Output ON")
-        btn_on.setObjectName("btn_output_on")
-        btn_off = QPushButton("Output OFF")
+        btn_off = QPushButton("■  Output OFF")
         btn_off.setObjectName("btn_output_off")
         btn_apply.clicked.connect(self._on_apply)
-        btn_on.clicked.connect(lambda: self.output_requested.emit(True))
         btn_off.clicked.connect(lambda: self.output_requested.emit(False))
         btn_row.addWidget(btn_apply)
-        btn_row.addWidget(btn_on)
         btn_row.addWidget(btn_off)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -1330,6 +1534,109 @@ class ChannelRow(QWidget):
         }
 
 
+# ─────────────────────────────────────────────────────────────
+#  DC ELECTROPHORESIS TAB  (Tabor WW5064)
+# ─────────────────────────────────────────────────────────────
+class DCChannelRow(QWidget):
+    def __init__(self, ch: int):
+        super().__init__()
+        self.ch = ch
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(8)
+
+        self.dc_enabled = QCheckBox()
+        self.dc_enabled.setChecked(False)
+        layout.addWidget(self.dc_enabled)
+        layout.addWidget(ch_label(ch))
+
+        layout.addWidget(QLabel("DC Level:"))
+        self.dc_volt = QDoubleSpinBox()
+        self.dc_volt.setRange(-5.0, 5.0)
+        self.dc_volt.setValue(0.0)
+        self.dc_volt.setDecimals(4)
+        self.dc_volt.setSuffix(" V")
+        self.dc_volt.setSingleStep(0.1)
+        self.dc_volt.setFixedWidth(110)
+        self.dc_volt.setEnabled(False)
+        layout.addWidget(self.dc_volt)
+
+        note = QLabel("(+/- 5 V into 50 ohm  /  +/- 10 V open circuit)")
+        note.setStyleSheet("color:#484f58; font-size:10px;")
+        layout.addWidget(note)
+        layout.addStretch()
+
+        self.dc_enabled.toggled.connect(self.dc_volt.setEnabled)
+
+    def get_config(self) -> dict:
+        return {
+            "ch":         self.ch,
+            "dc_volts":   self.dc_volt.value(),
+            "dc_enabled": self.dc_enabled.isChecked(),
+        }
+
+
+class DCTab(QWidget):
+    apply_requested = pyqtSignal(list)
+    clear_requested = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "DC ELECTROPHORESIS  —  Applies a static DC offset to selected "
+            "channels for electrophoretic particle manipulation.\n\n"
+            "Instrument: Tabor WW5064.  DC is produced by setting AC amplitude "
+            "to minimum (10 mVpp) and applying a VOLT:OFFS offset.  "
+            "Unchecked channels have their offset zeroed and output turned OFF."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#8b949e; font-size:11px; margin-bottom:8px;")
+        layout.addWidget(info)
+
+        grp = QGroupBox("DC CHANNEL CONFIGURATION")
+        gl  = QVBoxLayout(grp)
+        self.rows: list = []
+        for ch in range(1, 5):
+            if ch > 1:
+                gl.addWidget(hsep())
+            row = DCChannelRow(ch)
+            gl.addWidget(row)
+            self.rows.append(row)
+        layout.addWidget(grp)
+
+        warn = QLabel(
+            "WARNING  Do not mix DC and AC modes on the same channel.  "
+            "Click 'Clear DC' before switching back to EROT / DEP / EOR."
+        )
+        warn.setWordWrap(True)
+        warn.setStyleSheet(
+            "color:#f7c948; font-size:11px; border:1px solid #4a3a00; "
+            "border-radius:3px; padding:6px; margin-top:4px;"
+        )
+        layout.addWidget(warn)
+
+        btn_row = QHBoxLayout()
+        btn_apply = QPushButton("▶  Apply DC Voltages")
+        btn_apply.setObjectName("btn_start")
+        btn_clear = QPushButton("✕  Clear DC & Restore")
+        btn_clear.setObjectName("btn_output_off")
+        btn_apply.clicked.connect(self._on_apply)
+        btn_clear.clicked.connect(self._on_clear)
+        btn_row.addWidget(btn_apply)
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        layout.addStretch()
+
+    def _on_apply(self):
+        self.apply_requested.emit([row.get_config() for row in self.rows])
+
+    def _on_clear(self):
+        self.clear_requested.emit(list(range(1, 5)))
+
+
 class FreeTab(QWidget):
     apply_requested  = pyqtSignal(list)
     output_requested = pyqtSignal(bool)
@@ -1360,15 +1667,11 @@ class FreeTab(QWidget):
         btn_row = QHBoxLayout()
         btn_apply = QPushButton("▶  Apply to All Channels")
         btn_apply.setObjectName("btn_start")
-        btn_on  = QPushButton("All Output ON")
-        btn_on.setObjectName("btn_output_on")
-        btn_off = QPushButton("All Output OFF")
+        btn_off = QPushButton("■  All Output OFF")
         btn_off.setObjectName("btn_output_off")
         btn_apply.clicked.connect(self._on_apply)
-        btn_on.clicked.connect(lambda: self.output_requested.emit(True))
         btn_off.clicked.connect(lambda: self.output_requested.emit(False))
         btn_row.addWidget(btn_apply)
-        btn_row.addWidget(btn_on)
         btn_row.addWidget(btn_off)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -1429,7 +1732,7 @@ class MainWindow(QMainWindow):
         self.main_splitter.setHandleWidth(5)
 
         # Left: virtual instrument panel (hidden by default)
-        self.test_panel = TestModePanel(self.worker)
+        self.test_panel = LivePanel(self.worker)
         self.test_panel.setVisible(False)
         self.main_splitter.addWidget(self.test_panel)
 
@@ -1440,12 +1743,14 @@ class MainWindow(QMainWindow):
         self.tab_dep  = DEPTab()
         self.tab_eor  = EORTab()
         self.tab_free = FreeTab()
+        self.tab_dc   = DCTab()
 
         for tab, label in [
             (self.tab_erot, "  EROT  "),
             (self.tab_dep,  "  DEP   "),
             (self.tab_eor,  "  EOR   "),
             (self.tab_free, "  FREE  "),
+            (self.tab_dc,   "  DC EP "),
         ]:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
@@ -1491,6 +1796,8 @@ class MainWindow(QMainWindow):
         self.tab_eor.output_requested.connect(self.worker.all_output)
         self.tab_free.apply_requested.connect(self._run_free)
         self.tab_free.output_requested.connect(self.worker.all_output)
+        self.tab_dc.apply_requested.connect(self._run_dc)
+        self.tab_dc.clear_requested.connect(self._clear_dc)
 
     def _set_controls_enabled(self, enabled: bool):
         self.tabs.setEnabled(enabled)
@@ -1508,7 +1815,11 @@ class MainWindow(QMainWindow):
         ok = self.worker.connect(addr, buf, timeout)
         self.conn_panel.set_connected(ok, test_mode=False)
         self._set_controls_enabled(ok)
-        self._hide_test_panel()
+        if ok:
+            self.test_panel.set_mode(test_mode=False)
+            self._show_live_panel()
+        else:
+            self._hide_test_panel()
 
     def _on_disconnect(self):
         self.worker.disconnect()
@@ -1520,22 +1831,25 @@ class MainWindow(QMainWindow):
         ok = self.worker.connect_virtual(error_rate)
         self.conn_panel.set_connected(ok, test_mode=True)
         self._set_controls_enabled(ok)
-        # Reveal the virtual instrument panel on the left at a 1:2 ratio
-        self.test_panel.setVisible(True)
-        total = self.main_splitter.width()
-        self.main_splitter.setSizes([total // 3, (total * 2) // 3])
-        self.test_panel.start()
+        self.test_panel.set_mode(test_mode=True)
+        self._show_live_panel()
         self.console.log(
             "[TEST MODE] Use any mode tab normally — "
             "commands go to the virtual instrument.",
             color='#d2a8ff'
         )
 
+    def _show_live_panel(self):
+        """Reveal the live panel at a 1:2 ratio and start polling."""
+        self.test_panel.setVisible(True)
+        total = self.main_splitter.width()
+        self.main_splitter.setSizes([total // 3, (total * 2) // 3])
+        self.test_panel.start()
+
     def _hide_test_panel(self):
-        """Collapse the virtual panel and stop its refresh timer."""
+        """Collapse the live panel and stop its refresh timer."""
         self.test_panel.stop()
         self.test_panel.setVisible(False)
-        # Give all horizontal splitter space back to the tabs
         self.main_splitter.setSizes([0, self.main_splitter.width()])
 
     def resizeEvent(self, event):
@@ -1547,17 +1861,19 @@ class MainWindow(QMainWindow):
             self.vert_splitter.setSizes([int(h * 0.72), int(h * 0.28)])
 
     # ── mode runners ─────────────────────────────────────────
-    def _run_erot(self, freqs: list, volt: float, dwell: float, summary_only: bool):
+    def _run_erot(self, freqs: list, volt: float, dwell: float,
+                  summary_only: bool, ch_order: tuple):
         self.tab_erot.set_running(True)
-        mode_str = "summary" if summary_only else "verbose"
+        mode_str  = "summary" if summary_only else "verbose"
+        dir_str   = "CW" if ch_order == (1,4,3,2) else "CCW"
         self.console.log(
             f"[EROT] Queuing sweep: {len(freqs)} steps, {volt} Vpp, "
-            f"{dwell}s dwell  [{mode_str}]"
+            f"{dwell}s dwell  [{mode_str}] [{dir_str}]"
         )
         self.worker.reset()
         threading.Thread(
             target=self.worker.run_erot,
-            args=(freqs, volt, dwell, summary_only),
+            args=(freqs, volt, dwell, summary_only, ch_order),
             daemon=True
         ).start()
 
@@ -1589,11 +1905,26 @@ class MainWindow(QMainWindow):
             daemon=True
         ).start()
 
+    def _run_dc(self, configs: list):
+        self.worker.reset()
+        threading.Thread(
+            target=self.worker.run_dc,
+            args=(configs,),
+            daemon=True
+        ).start()
+
+    def _clear_dc(self, channels: list):
+        threading.Thread(
+            target=self.worker.clear_dc,
+            args=(channels,),
+            daemon=True
+        ).start()
+
     # ── mode-aware done handler ──────────────────────────────
     def _on_worker_done(self, mode: str):
         if mode == "erot":
             self.tab_erot.on_done()
-        # dep / eor / free: just log; no extra UI state to reset
+        # dep / eor / free / dc: no extra UI state to reset
 
     # ── cleanup ──────────────────────────────────────────────
     def closeEvent(self, event):

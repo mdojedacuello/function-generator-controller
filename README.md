@@ -7,10 +7,10 @@ A desktop application for controlling multi-channel VISA-compatible function gen
 ## Experimental Modes
 
 ### Electrorotation (EROT)
-Four channels in 90° phase quadrature (CH1: 0°, CH2: 90°, CH3: 180°, CH4: 270°). Define a frequency list, set the applied potential and dwell time, and the app sweeps through each step automatically. Measured frequencies are read back from the instrument and logged. A summary-only mode suppresses individual SCPI lines and logs one line per step plus a final average.
+Four channels in 90° phase quadrature (CH1: 0°, CH2: 90°, CH3: 180°, CH4: 270°). Define a comma-separated frequency list, set the applied potential (Vpp) and dwell time, and the app sweeps through each step automatically. Measured frequencies are read back from the instrument and logged. A **Summary only** checkbox suppresses individual SCPI lines and logs one clean line per step plus a final average.
 
 ### Dielectrophoresis (DEP)
-All four channels output the same frequency, amplitude, and phase (0°). Set frequency and potential, click Apply. Suitable for particle trapping and manipulation experiments.
+All four channels output the same frequency, amplitude, and phase (0°). Set frequency and potential, click Apply.
 
 ### Electroorientation (EOR)
 Activates one opposing electrode pair at a time: either CH1–CH3 or CH2–CH4. The active pair receives 0° and 180° respectively; the inactive pair is turned off. Switch between pairs at any time without disconnecting.
@@ -18,15 +18,20 @@ Activates one opposing electrode pair at a time: either CH1–CH3 or CH2–CH4. 
 ### Free Mode
 Full independent control of each channel — individual frequency, amplitude, and phase. Channels can be individually enabled or disabled.
 
+### DC Electrophoresis (DC EP)  *(Tabor WW5064)*
+Applies a static DC offset voltage to selected channels for electrophoretic particle manipulation. DC is produced by setting the AC amplitude to the instrument minimum (10 mVpp) and applying `VOLT:OFFS`. Supports positive and negative voltages (±5 V into 50 Ω / ±10 V open circuit). Unselected channels have their offset zeroed and output turned off. A **Clear DC & Restore** button returns all channels to a safe AC-ready state before switching back to EROT / DEP / EOR.
+
 ---
 
 ## Features
 
 - **SCPI over VISA** — works with any USB, GPIB, or Serial VISA instrument
-- **Resizable layout** — horizontal splitter (virtual panel / tabs) and vertical splitter (work area / console) are fully user-adjustable
+- **Resizable layout** — horizontal splitter (live panel / tabs) and vertical splitter (work area / console) are fully user-adjustable
+- **Live channel state panel** — shown for both real hardware and virtual instrument; displays channel frequency, amplitude, phase, and on/off state with a real-time waveform preview
+- **Voltage-scaled waveform canvas** — Y-axis ticks scale to the actual applied voltage; DC channels render as flat lines
 - **Live SCPI console** — timestamped log of every command and response, with a Clear button
 - **Frequency sweep input** — comma-separated values with live validation and scientific notation support (`1e4`, `7e3`)
-- **Virtual instrument / test mode** — built-in software simulator with realistic FREQ? noise and optional error injection; includes a live waveform preview with a voltage-scaled Y-axis
+- **Virtual instrument / test mode** — built-in software simulator with realistic `FREQ?` noise and optional error injection; launch with `--test` flag or the Test Mode button
 - **Verbose / summary logging** — toggle per-command SCPI lines or show one summary line per sweep step
 - **Thread-safe worker** — all VISA I/O runs on a daemon thread behind a `threading.Lock`; the GUI stays responsive during sweeps and long dwells
 
@@ -60,7 +65,7 @@ pip install PyQt5 pyvisa pyvisa-py pyserial pyusb
 
 ### From source
 ```bash
-git clone https://github.com/mdojedacuello/function-generator-controller.git
+git clone https://github.com/YOUR_USERNAME/function-generator-controller.git
 cd function-generator-controller
 pip install -r requirements.txt
 python function_generator_app.py
@@ -84,7 +89,7 @@ python function_generator_app.py --test
 ```
 
 ### Finding your VISA address
-If you are unsure of your instrument's resource string, click **Scan Ports** in the connection panel. Alternatively, from a Python prompt:
+Click **Scan Ports** in the connection panel, or from a Python prompt:
 
 ```python
 import pyvisa
@@ -98,6 +103,15 @@ Common formats:
 | `USB0::0x0957::0x1507::MY57001222::0::INSTR` | USB-VISA |
 | `GPIB0::11::INSTR` | GPIB |
 | `ASRL7::INSTR` | Serial (COM7) |
+
+---
+
+## Tested Instruments
+
+| Instrument | Modes supported |
+|-----------|----------------|
+| Tabor Electronics WW5064 | EROT, DEP, EOR, FREE, DC EP |
+| Any VISA-compatible multi-channel generator | EROT, DEP, EOR, FREE |
 
 ---
 
@@ -122,7 +136,6 @@ pyinstaller --onefile --windowed \
   function_generator_app.py
 ```
 
-The unsigned executable will be at `dist/FunctionGeneratorController.exe`.
 Signed releases are produced automatically via the GitHub Actions + SignPath pipeline on every version tag.
 
 ---
@@ -144,35 +157,34 @@ function-generator-controller/
 
 ## Architecture Notes
 
-The application follows a clean separation between hardware I/O and the GUI:
-
 ```
 MainWindow (PyQt5 GUI thread)
 │
 ├── ConnectionPanel       — VISA address, buffer, timeout, connect/disconnect/test
 ├── QSplitter (vertical)
 │   ├── QSplitter (horizontal)
-│   │   ├── TestModePanel — live channel state + waveform preview (test mode only)
+│   │   ├── LivePanel     — channel state + waveform preview (real & virtual)
 │   │   └── QTabWidget
-│   │       ├── EROTTab   — frequency sweep configuration
+│   │       ├── EROTTab   — frequency sweep with 90° quadrature
 │   │       ├── DEPTab    — single-frequency DEP signal
 │   │       ├── EORTab    — opposing electrode pair selection
-│   │       └── FreeTab   — per-channel independent control
+│   │       ├── FreeTab   — per-channel independent control
+│   │       └── DCTab     — DC electrophoresis (Tabor WW5064)
 │   └── Console           — timestamped SCPI log
 │
 └── InstrumentWorker (QObject)
     ├── VirtualInstrument — software simulator (test mode)
     ├── threading.Lock    — serialises all VISA access
-    └── daemon threads    — run_erot / run_dep / run_eor / run_free
+    └── daemon threads    — run_erot / run_dep / run_eor / run_free / run_dc
 ```
 
-`InstrumentWorker` is a plain `QObject` — no `QThread`. All long-running methods are dispatched via `threading.Thread(daemon=True)`. Qt signals (`log_signal`, `error_signal`, `done_signal`, `freq_signal`) carry results back to the GUI thread via Qt's queued connection mechanism.
+`InstrumentWorker` is a plain `QObject` — no `QThread`. All long-running methods are dispatched via `threading.Thread(daemon=True)`. Qt signals carry results back to the GUI thread via queued connections.
 
 ---
 
 ## Contributing
 
-Contributions are welcome. Please open an issue before submitting a pull request for significant changes, so the scope can be discussed first.
+Contributions are welcome. Please open an issue before submitting a pull request for significant changes.
 
 Things that would be useful:
 - Support for additional instrument families (Rigol, Tektronix, Stanford Research)
@@ -193,8 +205,8 @@ MIT — see [LICENSE](LICENSE).
 If you use this software in published research, please cite it:
 
 ```
-Ojeda Cuello, M. (2016). Function Generator Controller (Version X.X) [Software].
-GitHub. https://github.com/mdojedacuello/function-generator-controller
+Author. (Year). Function Generator Controller (Version X.X) [Software].
+GitHub. https://github.com/YOUR_USERNAME/function-generator-controller
 ```
 
 A `CITATION.cff` file is provided for automatic citation in GitHub and Zenodo.
